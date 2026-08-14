@@ -86,25 +86,17 @@ QwIDAQAB
         console.log(`Connecting to ${host}:5500`)
         const socket = tls.connect({ host: host, port: 5500, rejectUnauthorized: false }, function () {
             console.log('TLS connection established')
-            socket.setTimeout(60000) // 60 seconds timeout
             socket.write(
                 JSON.stringify({ type: 'request', cmd: 'setDeviceInit', data: { set: 'true', constantConnect: 'Y' } }),
             )
         })
 
-        socket.on('timeout', () => {
-            console.error('❌ Socket timed out waiting for response from appliance! (60s)')
-            socket.destroy()
-            reject(new Error('Timeout'))
-        })
-
         function onMessage(json: any) {
-            console.log('Received:', json.cmd || json.type)
             console.log(json)
 
             if (json.type === 'response') {
-                if (json.data && json.data.result && json.data.result !== '000') {
-                    console.warn('Error code returned!', json.data.result)
+                if (json.data.result && json.data.result !== '000') {
+                    console.warn('Error code returned!')
                     return
                 }
 
