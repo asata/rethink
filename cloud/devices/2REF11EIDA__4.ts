@@ -62,6 +62,14 @@ export default class Device extends AABBDevice {
                         name: 'Convertible',
                         options: FLEX_OPTIONS,
                     },
+                    express_freeze: {
+                        platform: 'switch',
+                        icon: 'mdi:snowflake-alert',
+                        unique_id: '$deviceid-express_freeze',
+                        state_topic: '$this/express_freeze',
+                        command_topic: '$this/express_freeze/set',
+                        name: 'Express Freeze',
+                    },
                     door: {
                         platform: 'binary_sensor',
                         device_class: 'door',
@@ -82,14 +90,16 @@ export default class Device extends AABBDevice {
         // I'm not sure what is the proper way to identify packet types, so let's match
         // on the length and a few initial bytes
 
-        if (buf.length === 2 + 68 * 2 && buf[0] == 0x10 && buf[1] == 0xec) {
+        if (buf[0] == 0x10 && buf[1] == 0xec) {
             // 10EC (prev status) (cur status)
-            this.processStatus(buf.subarray(2 + 68, 2 + 68 + 68))
+            const blockLen = (buf.length - 2) / 2
+            this.processStatus(buf.subarray(2 + blockLen, 2 + blockLen + blockLen))
         }
 
-        if (buf.length === 2 + 68 && buf[0] == 0x10 && buf[1] == 0xeb) {
+        if (buf[0] == 0x10 && buf[1] == 0xeb) {
             // 10EB (initial status)
-            this.processStatus(buf.subarray(2, 2 + 68 + 68))
+            const blockLen = buf.length - 2
+            this.processStatus(buf.subarray(2, 2 + blockLen))
         }
     }
 
@@ -113,6 +123,7 @@ export default class Device extends AABBDevice {
         this.publishProperty('fridge_setpoint', setpointFridge)
         this.publishProperty('freezer_setpoint', setpointFreezer)
         this.publishProperty('flex_setpoint', FLEX_OPTIONS[setpointFlex - 1])
+        this.publishProperty('express_freeze', icePlus === 2 ? 'ON' : 'OFF')
     }
 
     //  0                   1                   2                   3                   4                   5                   6                   7                   8                   9                  10
@@ -157,6 +168,9 @@ export default class Device extends AABBDevice {
                 baseMessage[2 + 13] = 1 + index
                 this.send(baseMessage)
             }
+        } else if (prop === 'express_freeze') {
+            baseMessage[2 + 3] = mqttValue === 'ON' ? 2 : 1
+            this.send(baseMessage)
         } else {
             console.warn(`Unknown property ${prop}`)
         }

@@ -14,13 +14,15 @@ RUN npm run build && npm prune --omit=dev
 FROM alpine:3.20 AS runtime
 WORKDIR /app
 
-RUN apk add --no-cache nodejs openssl \
+RUN apk add --no-cache nodejs npm openssl bash \
+        && npm install -g tsx \
 	&& addgroup -S app \
 	&& adduser -S -G app app
 
 COPY --from=build /app/package.json /app/package-lock.json ./
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
+COPY --from=build /app/tools ./tools
 COPY config.jsonc /app/config.json
 
 RUN mkdir -p /app/data

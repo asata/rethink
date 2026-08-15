@@ -86,17 +86,25 @@ QwIDAQAB
         console.log(`Connecting to ${host}:5500`)
         const socket = tls.connect({ host: host, port: 5500, rejectUnauthorized: false }, function () {
             console.log('TLS connection established')
+            socket.setTimeout(60000) // 60 seconds timeout
             socket.write(
                 JSON.stringify({ type: 'request', cmd: 'setDeviceInit', data: { set: 'true', constantConnect: 'Y' } }),
             )
         })
 
+        socket.on('timeout', () => {
+            console.error('❌ Socket timed out waiting for response from appliance! (60s)')
+            socket.destroy()
+            reject(new Error('Timeout'))
+        })
+
         function onMessage(json: any) {
+            console.log('Received:', json.cmd || json.type)
             console.log(json)
 
             if (json.type === 'response') {
-                if (json.data.result && json.data.result !== '000') {
-                    console.warn('Error code returned!')
+                if (json.data && json.data.result && json.data.result !== '000') {
+                    console.warn('Error code returned!', json.data.result)
                     return
                 }
 
@@ -114,7 +122,7 @@ QwIDAQAB
                             },
                         }),
                     )
-                if (json.cmd === 'getDeviceInfo')
+                if (json.cmd === 'getDeviceInfo') {
                     socket.write(
                         JSON.stringify({
                             type: 'request',
@@ -122,14 +130,13 @@ QwIDAQAB
                             data: {
                                 otp: '0123456789abcdef0123456789abcdef0123456789abcdef',
                                 svccode: 'SVC202',
-                                // OP is the default. On some firmwares this value affects the target hostname in
-                                // the initial HTTPS request, so let's not mess with it without a good reason.
-                                // Setting it to QA or ST enables the debug UART :)
                                 svcphase: 'OP',
                                 constantConnect: 'Y',
                             },
                         }),
                     )
+                }
+
                 if (json.cmd === 'setCertInfo') {
                     const b64ssid = Buffer.from(wifiname, 'utf-8').toString('base64')
                     const b64password = Buffer.from(wifipass, 'utf-8').toString('base64')
@@ -148,15 +155,15 @@ QwIDAQAB
                             },
                         }),
                     )
-                }
-                if (json.cmd === 'setApInfo')
-                    socket.write(JSON.stringify({ type: 'request', cmd: 'releaseDev', data: {} }))
-                if (json.cmd === 'releaseDev') {
-                    console.log('Setup completed, the device will now connect to your Wi-Fi')
-                    socket.destroy()
 
-                    console.log('ThinQ2 setup successful, see rethink-cloud logs for a follow-up')
-                    resolve()
+                    console.log('✅ Sent setApInfo. Sending releaseDev immediately without waiting for ACK...')
+                    socket.write(JSON.stringify({ type: 'request', cmd: 'releaseDev', data: {} }))
+
+                    setTimeout(() => {
+                        console.log('🎉 Setup commands completely sent! The device should now stop blinking and connect to your Wi-Fi.')
+                        socket.destroy()
+                        resolve()
+                    }, 2000)
                 }
             }
         }
@@ -170,14 +177,14 @@ QwIDAQAB
     })
 }
 
-;(async () => {
+; (async () => {
     // We try the ThinQ 1 protocol first. The formatting should be rejected by ThinQ2 appliances. Hopefully.
     try {
-        console.log('Trying ThinQ 1 setup')
-        await thinq1Setup()
+        console.log('Skipping ThinQ 1 setup to avoid WashTower AP crashes...')
+        // await thinq1Setup()
+        throw new Error('Skipped')
     } catch (err) {
-        console.log('ThinQ 1 setup failed', err)
-        console.log('Trying ThinQ 2 setup')
+        console.log('Trying ThinQ 2 setup directly...')
         thinq2Setup()
     }
 })()
