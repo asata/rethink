@@ -31,11 +31,18 @@ The following appliances are currently supported in rethink:
     - 👍 F4X7511TWS (VCDWL2QEUK), Front-Load Washing Machine - mostly working
     - 🫤 WT7300CW - preliminary support
     - 👍 WM3900HBA (F3L2CYU\_\_), Front-Load Washing Machine - mostly working
+    - 👍 FV1413H2B, Washing Machine - mostly working,
+    - 👍 F3L7CYK5W_US_WIFI, Front-Load Washing Machine - mostly working
 - Dryers:
     - 🫤 DLE7300WE - preliminary support
     - 👍 DLEX3900B (RV13B6BSD_D_US_WIFI), Electric Dryer - mostly working
+    - 👍 RV13B6ES_D_US_WIFI, Electric Dryer - mostly working
 - WashTowers (combined washer+dryer):
     - 👍 WKEX200HBA (WTL_FXU_BDV_NA_01), WashTower - mostly working
+- Dehumidifiers
+    - 👍 MD19GQGE0, Smart Dehumidifier - mostly working
+- Range Hoods:
+    - 👍 HCED3015D (STUDIO_HOOD), Generic identifier and probably works with multiple models. Working.
 
 The supported appliances can be used "out of the box" with HomeAssistant or another compatible MQTT consumer.  
 Appliances not listed above can still be used with the bridge mode, but they will not be translated to MQTT. Contributions are welcome!
