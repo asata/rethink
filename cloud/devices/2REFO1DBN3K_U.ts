@@ -17,6 +17,8 @@ const FLEX_OPTIONS = ['Chilled Wine', 'Deli/Snacks', 'Cold Drink', 'Meat/Seafood
 export default class Device extends AABBDevice {
     readonly deviceConfig: DeviceDiscovery
     temperatureUnit: TemperatureUnit | undefined
+    lastStatSequence: number = -1
+    lastEnergySequence: number = -1
 
     constructor(HA: Connection, thinq: Thinq2Device, meta: Metadata) {
         super(HA, thinq)
@@ -62,12 +64,89 @@ export default class Device extends AABBDevice {
                         name: 'Convertible',
                         options: FLEX_OPTIONS,
                     },
+                    express_freeze: {
+                        platform: 'switch',
+                        icon: 'mdi:snowflake-alert',
+                        unique_id: '$deviceid-express_freeze',
+                        state_topic: '$this/express_freeze',
+                        command_topic: '$this/express_freeze/set',
+                        name: 'Express Freeze',
+                    },
                     door: {
                         platform: 'binary_sensor',
                         device_class: 'door',
                         unique_id: '$deviceid-door',
                         state_topic: '$this/door',
                         name: 'Door',
+                    },
+                    energy_consumption_delta: {
+                        platform: 'sensor',
+                        state_class: 'measurement',
+                        unique_id: '$deviceid-energy_consumption_delta',
+                        state_topic: '$this/energy_consumption_delta',
+                        name: 'Energy Consumption (15m)',
+                        unit_of_measurement: 'Wh',
+                        icon: 'mdi:flash',
+                    },
+                    energy_consumption: {
+                        platform: 'sensor',
+                        device_class: 'energy',
+                        state_class: 'total_increasing',
+                        unique_id: '$deviceid-energy_consumption',
+                        state_topic: '$this/energy_consumption',
+                        name: 'Energy Consumption',
+                        unit_of_measurement: 'Wh',
+                        icon: 'mdi:flash',
+                    },
+                    fridge_door_opens_delta: {
+                        platform: 'sensor',
+                        state_class: 'measurement',
+                        unique_id: '$deviceid-fridge_door_opens_delta',
+                        state_topic: '$this/fridge_door_opens_delta',
+                        name: 'Fridge Door Opens (15m)',
+                        icon: 'mdi:door-open',
+                    },
+                    fridge_door_opens: {
+                        platform: 'sensor',
+                        state_class: 'total_increasing',
+                        unique_id: '$deviceid-fridge_door_opens',
+                        state_topic: '$this/fridge_door_opens',
+                        name: 'Fridge Door Opens',
+                        icon: 'mdi:door-open',
+                    },
+                    freezer_door_opens_delta: {
+                        platform: 'sensor',
+                        state_class: 'measurement',
+                        unique_id: '$deviceid-freezer_door_opens_delta',
+                        state_topic: '$this/freezer_door_opens_delta',
+                        name: 'Freezer Door Opens (15m)',
+                        icon: 'mdi:door-open',
+                    },
+                    freezer_door_opens: {
+                        platform: 'sensor',
+                        state_class: 'total_increasing',
+                        unique_id: '$deviceid-freezer_door_opens',
+                        state_topic: '$this/freezer_door_opens',
+                        name: 'Freezer Door Opens',
+                        icon: 'mdi:door-open',
+                    },
+                    fridge_door_duration_delta: {
+                        platform: 'sensor',
+                        state_class: 'measurement',
+                        unique_id: '$deviceid-fridge_door_duration_delta',
+                        state_topic: '$this/fridge_door_duration_delta',
+                        name: 'Fridge Door Open Duration (15m)',
+                        unit_of_measurement: 's',
+                        icon: 'mdi:timer',
+                    },
+                    freezer_door_duration_delta: {
+                        platform: 'sensor',
+                        state_class: 'measurement',
+                        unique_id: '$deviceid-freezer_door_duration_delta',
+                        state_topic: '$this/freezer_door_duration_delta',
+                        name: 'Freezer Door Open Duration (15m)',
+                        unit_of_measurement: 's',
+                        icon: 'mdi:timer',
                     },
                 },
             }),
@@ -82,14 +161,26 @@ export default class Device extends AABBDevice {
         // I'm not sure what is the proper way to identify packet types, so let's match
         // on the length and a few initial bytes
 
-        if (buf.length === 2 + 68 * 2 && buf[0] == 0x10 && buf[1] == 0xec) {
+        if (buf[0] == 0x10 && buf[1] == 0xec) {
             // 10EC (prev status) (cur status)
-            this.processStatus(buf.subarray(2 + 68, 2 + 68 + 68))
+            const blockLen = (buf.length - 2) / 2
+            this.processStatus(buf.subarray(2 + blockLen, 2 + blockLen + blockLen))
         }
 
-        if (buf.length === 2 + 68 && buf[0] == 0x10 && buf[1] == 0xeb) {
+        if (buf[0] == 0x10 && buf[1] == 0xeb) {
             // 10EB (initial status)
-            this.processStatus(buf.subarray(2, 2 + 68 + 68))
+            const blockLen = buf.length - 2
+            this.processStatus(buf.subarray(2, 2 + blockLen))
+        }
+
+        if (buf[0] == 0x10 && buf[1] == 0xc5) {
+            // 10C5 (energy & statistics)
+            this.processStatistics(buf)
+        }
+
+        if (buf[0] == 0x10 && buf[1] == 0x3e) {
+            // 103E (energy usage)
+            this.processEnergyUsage(buf)
         }
     }
 
@@ -113,6 +204,73 @@ export default class Device extends AABBDevice {
         this.publishProperty('fridge_setpoint', setpointFridge)
         this.publishProperty('freezer_setpoint', setpointFreezer)
         this.publishProperty('flex_setpoint', FLEX_OPTIONS[setpointFlex - 1])
+        this.publishProperty('express_freeze', icePlus === 2 ? 'ON' : 'OFF')
+    }
+
+    processEnergyUsage(buf: Buffer) {
+        if (buf.length < 7) return
+
+        const sequence = buf[6]
+        if (sequence === this.lastEnergySequence) {
+            // Deduplicate burst packets sent within the same 15-minute interval
+            return
+        }
+        this.lastEnergySequence = sequence
+
+        // 10 3E [0~1: 15-min usage] [2~3: 16-bit cumulative counter] [4: sequence]
+        // In buf payload (where buf[0] is 0x10, buf[1] is 0x3E):
+        // buf[2~3] = 15-min usage delta
+        // buf[4~5] = 16-bit cumulative counter
+        const energyDelta = buf.readUInt16BE(2)
+        const energyAccum = buf.readUInt16BE(4)
+
+        this.publishProperty('energy_consumption_delta', energyDelta.toString())
+        this.publishProperty('energy_consumption', energyAccum.toString())
+    }
+
+    processStatistics(buf: Buffer) {
+        if (buf.length < 28) return
+
+        const sequence = buf[2]
+        if (sequence === this.lastStatSequence) {
+            // Deduplicate burst packets sent within the same 15-minute interval
+            return
+        }
+        this.lastStatSequence = sequence
+
+        // Marker 0x04: Fridge Stats
+        if (buf[3] === 0x04) {
+            const fridgeDelta = buf.readUInt16BE(5)
+            const fridgeAccum = buf.readUIntBE(7, 3)
+            this.publishProperty('fridge_door_opens_delta', fridgeDelta.toString())
+            this.publishProperty('fridge_door_opens', fridgeAccum.toString())
+        }
+
+        // Marker 0x03: Freezer Stats
+        if (buf[10] === 0x03) {
+            const freezerDelta = buf.readUInt16BE(11)
+            const freezerAccum = buf.readUIntBE(13, 3)
+            this.publishProperty('freezer_door_opens_delta', freezerDelta.toString())
+            this.publishProperty('freezer_door_opens', freezerAccum.toString())
+        }
+
+        // Marker 0x11: Unknown (previously thought to be Energy)
+        /*
+        if (buf[16] === 0x11) {
+            const energyDelta = buf.readUInt16BE(17)
+            const energyAccum = buf.readUIntBE(19, 3)
+            this.publishProperty('energy_consumption_delta', energyDelta.toString())
+            this.publishProperty('energy_consumption', energyAccum.toString())
+        }
+        */
+
+        // Marker 0x13: Door Open Durations (Delta)
+        if (buf[22] === 0x13) {
+            const fridgeDurationDelta = buf.readUInt16BE(23)
+            const freezerDurationDelta = buf.readUInt16BE(26)
+            this.publishProperty('fridge_door_duration_delta', fridgeDurationDelta.toString())
+            this.publishProperty('freezer_door_duration_delta', freezerDurationDelta.toString())
+        }
     }
 
     //  0                   1                   2                   3                   4                   5                   6                   7                   8                   9                  10
@@ -157,6 +315,9 @@ export default class Device extends AABBDevice {
                 baseMessage[2 + 13] = 1 + index
                 this.send(baseMessage)
             }
+        } else if (prop === 'express_freeze') {
+            baseMessage[2 + 3] = mqttValue === 'ON' ? 2 : 1
+            this.send(baseMessage)
         } else {
             console.warn(`Unknown property ${prop}`)
         }
