@@ -13,12 +13,126 @@ import {
 } from './fridge_common'
 
 const FLEX_OPTIONS = ['Chilled Wine', 'Deli/Snacks', 'Cold Drink', 'Meat/Seafood', 'Freezer']
+export const NIGHT_GLARE_OPTIONS = ['Off', 'Sunset/Sunrise', 'Custom'] as const
+type NightGlareMode = (typeof NIGHT_GLARE_OPTIONS)[number]
+
+const NIGHT_GLARE_COMMAND_MODE: Record<NightGlareMode, number> = {
+    Off: 0x00,
+    'Sunset/Sunrise': 0x01,
+    Custom: 0x02,
+}
+
+const NIGHT_GLARE_STATUS_MODE: Record<number, NightGlareMode> = {
+    0x00: 'Off',
+    0x02: 'Sunset/Sunrise',
+    0x03: 'Custom',
+}
+
+const KST_OFFSET_MS = 9 * 60 * 60 * 1000
+const F017_BASE =
+    'F017FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF000000FFFF00FFFFFFFF00FFFFFFFFFFFFFFFFFF00FFFFFF1EFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF0AFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF'
+const SMART_CARE_BASE =
+    'F017FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF00FFFFFF000000FFFF00FFFFFFFF00FFFFFFFFFFFFFFFFFF00FFFFFF1EFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF0AFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF00FFFFFFFFFFFFFFFFFFFFFFFFFFFFFF'
+
+export function buildF017Message(unit: TemperatureUnit): Buffer {
+    const message = Buffer.from(F017_BASE, 'hex')
+    message[2 + 8] = unit === 'C' ? 1 : 0
+    return message
+}
+
+export function buildSmartCareCommands(enabled: boolean): Buffer[] {
+    // Smart Care+ uses the 120-byte F017 shape captured from ThinQ, not the
+    // legacy 101-byte F017 shape used for temperature and Express Freeze.
+    const smartCareMessage = Buffer.from(SMART_CARE_BASE, 'hex')
+    smartCareMessage[2 + 17] = enabled ? 1 : 0
+    if (enabled) return [smartCareMessage]
+
+    const restoreFreshAirMessage = Buffer.from(SMART_CARE_BASE, 'hex')
+    restoreFreshAirMessage[2 + 17] = 0xff
+    restoreFreshAirMessage[2 + 4] = 0x06
+    return [smartCareMessage, restoreFreshAirMessage]
+}
+
+function parseTime(value: string): { hours: number; minutes: number } | undefined {
+    const match = /^(\d{2}):(\d{2})$/.exec(value)
+    if (!match) return undefined
+
+    const hours = Number(match[1])
+    const minutes = Number(match[2])
+    if (hours > 23 || minutes > 59) return undefined
+    return { hours, minutes }
+}
+
+function writeKstTimeAsUtc(target: Buffer, offset: number, kstDate: Date) {
+    const utc = new Date(kstDate.getTime() - KST_OFFSET_MS)
+    target[offset] = utc.getUTCFullYear() % 100
+    target[offset + 1] = utc.getUTCMonth() + 1
+    target[offset + 2] = utc.getUTCDate()
+    target[offset + 3] = utc.getUTCHours()
+    target[offset + 4] = utc.getUTCMinutes()
+    target[offset + 5] = utc.getUTCSeconds()
+}
+
+export function buildNightGlareCommand(
+    mode: NightGlareMode,
+    start: string,
+    end: string,
+    brightness: number,
+    now: Date = new Date(),
+): Buffer {
+    if (!NIGHT_GLARE_OPTIONS.includes(mode)) throw new Error(`Invalid night glare mode: ${mode}`)
+    if (!Number.isInteger(brightness) || brightness < 0 || brightness > 100)
+        throw new Error(`Invalid night glare brightness: ${brightness}`)
+
+    const command = Buffer.alloc(18)
+    command[0] = 0xf0
+    command[1] = 0x10
+    command[2] = 0x02
+    command[3] = NIGHT_GLARE_COMMAND_MODE[mode]
+    command[17] = brightness
+
+    if (mode === 'Off') return command
+
+    const parsedStart = parseTime(start)
+    const parsedEnd = parseTime(end)
+    if (!parsedStart || !parsedEnd) throw new Error(`Invalid night glare schedule: ${start}-${end}`)
+
+    // Shift now into KST, then use UTC accessors as timezone-independent KST calendar fields.
+    const kstNow = new Date(now.getTime() + KST_OFFSET_MS)
+    const startKst = new Date(
+        Date.UTC(
+            kstNow.getUTCFullYear(),
+            kstNow.getUTCMonth(),
+            kstNow.getUTCDate(),
+            parsedStart.hours,
+            parsedStart.minutes,
+        ),
+    )
+    const endKst = new Date(
+        Date.UTC(
+            kstNow.getUTCFullYear(),
+            kstNow.getUTCMonth(),
+            kstNow.getUTCDate(),
+            parsedEnd.hours,
+            parsedEnd.minutes,
+        ),
+    )
+    if (endKst.getTime() <= startKst.getTime()) endKst.setUTCDate(endKst.getUTCDate() + 1)
+
+    writeKstTimeAsUtc(command, 4, startKst)
+    writeKstTimeAsUtc(command, 10, endKst)
+    return command
+}
 
 export default class Device extends AABBDevice {
     readonly deviceConfig: DeviceDiscovery
     temperatureUnit: TemperatureUnit | undefined
     lastStatSequence: number = -1
     lastEnergySequence: number = -1
+    nightGlareMode: NightGlareMode = 'Off'
+    nightGlareStart = '21:00'
+    nightGlareEnd = '06:00'
+    nightGlareBrightness = 30
 
     constructor(HA: Connection, thinq: Thinq2Device, meta: Metadata) {
         super(HA, thinq)
@@ -72,6 +186,53 @@ export default class Device extends AABBDevice {
                         command_topic: '$this/express_freeze/set',
                         name: 'Express Freeze',
                     },
+                    smart_care: {
+                        platform: 'switch',
+                        icon: 'mdi:shield-check',
+                        unique_id: '$deviceid-smart_care',
+                        state_topic: '$this/smart_care',
+                        command_topic: '$this/smart_care/set',
+                        name: 'Smart Care+',
+                    },
+                    night_glare_mode: {
+                        platform: 'select',
+                        icon: 'mdi:theme-light-dark',
+                        unique_id: '$deviceid-night_glare_mode',
+                        state_topic: '$this/night_glare_mode',
+                        command_topic: '$this/night_glare_mode/set',
+                        name: 'Night Glare Mode',
+                        options: NIGHT_GLARE_OPTIONS,
+                    },
+                    night_glare_start: {
+                        platform: 'text',
+                        icon: 'mdi:clock-start',
+                        unique_id: '$deviceid-night_glare_start',
+                        state_topic: '$this/night_glare_start',
+                        command_topic: '$this/night_glare_start/set',
+                        name: 'Night Glare Start',
+                        pattern: '^([01]\\d|2[0-3]):[0-5]\\d$',
+                    },
+                    night_glare_end: {
+                        platform: 'text',
+                        icon: 'mdi:clock-end',
+                        unique_id: '$deviceid-night_glare_end',
+                        state_topic: '$this/night_glare_end',
+                        command_topic: '$this/night_glare_end/set',
+                        name: 'Night Glare End',
+                        pattern: '^([01]\\d|2[0-3]):[0-5]\\d$',
+                    },
+                    night_glare_brightness: {
+                        platform: 'number',
+                        icon: 'mdi:brightness-percent',
+                        unique_id: '$deviceid-night_glare_brightness',
+                        state_topic: '$this/night_glare_brightness',
+                        command_topic: '$this/night_glare_brightness/set',
+                        name: 'Night Glare Brightness',
+                        unit_of_measurement: '%',
+                        min: 0,
+                        max: 100,
+                        step: 10,
+                    },
                     door: {
                         platform: 'binary_sensor',
                         device_class: 'door',
@@ -106,14 +267,7 @@ export default class Device extends AABBDevice {
                         name: 'Fridge Door Opens (15m)',
                         icon: 'mdi:door-open',
                     },
-                    fridge_door_opens: {
-                        platform: 'sensor',
-                        state_class: 'total_increasing',
-                        unique_id: '$deviceid-fridge_door_opens',
-                        state_topic: '$this/fridge_door_opens',
-                        name: 'Fridge Door Opens',
-                        icon: 'mdi:door-open',
-                    },
+
                     freezer_door_opens_delta: {
                         platform: 'sensor',
                         state_class: 'measurement',
@@ -122,14 +276,7 @@ export default class Device extends AABBDevice {
                         name: 'Freezer Door Opens (15m)',
                         icon: 'mdi:door-open',
                     },
-                    freezer_door_opens: {
-                        platform: 'sensor',
-                        state_class: 'total_increasing',
-                        unique_id: '$deviceid-freezer_door_opens',
-                        state_topic: '$this/freezer_door_opens',
-                        name: 'Freezer Door Opens',
-                        icon: 'mdi:door-open',
-                    },
+
                     fridge_door_duration_delta: {
                         platform: 'sensor',
                         state_class: 'measurement',
@@ -151,6 +298,9 @@ export default class Device extends AABBDevice {
                 },
             }),
         )
+        this.publishProperty('night_glare_start', this.nightGlareStart)
+        this.publishProperty('night_glare_end', this.nightGlareEnd)
+        this.publishProperty('night_glare_brightness', this.nightGlareBrightness)
     }
 
     start() {
@@ -187,6 +337,11 @@ export default class Device extends AABBDevice {
     processStatus(curStatus: Buffer) {
         // status block example:
         // 0209060202020400000001FFFF0300FFFF00FFFFFFFFFFFFFF020001010100000101FF6161FFFFFF01FF00FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF0078FF0000
+        if (curStatus.length < 34) {
+            console.warn(`Unexpected refrigerator status length: ${curStatus.length}`)
+            return
+        }
+
         const unit = curStatus[8] ? 'C' : 'F'
         this.setTemperatureUnit(unit)
 
@@ -197,6 +352,8 @@ export default class Device extends AABBDevice {
         const anyDoorOpen = curStatus[7]
         const panelLock = curStatus[10] // 2=locked 1=unlocked
         const setpointFlex = curStatus[13] // 1 - chilled wine. 2 - deli/snacks. 3 - cold drink. 4 - meat/seafood. 5 - freezer
+        const smartCare = curStatus[17]
+        const nightGlareStatus = curStatus[30]
         const iceDoor = curStatus[32] // 0=off 1=on 2=full
         const iceCube = curStatus[33] // 0=off 1=on 2=full
 
@@ -205,6 +362,16 @@ export default class Device extends AABBDevice {
         this.publishProperty('freezer_setpoint', setpointFreezer)
         this.publishProperty('flex_setpoint', FLEX_OPTIONS[setpointFlex - 1])
         this.publishProperty('express_freeze', icePlus === 2 ? 'ON' : 'OFF')
+        if (smartCare === 0 || smartCare === 1) this.publishProperty('smart_care', smartCare === 1 ? 'ON' : 'OFF')
+        else console.warn(`Unexpected Smart Care+ status: ${smartCare}`)
+
+        const nightGlareMode = NIGHT_GLARE_STATUS_MODE[nightGlareStatus]
+        if (nightGlareMode) {
+            this.nightGlareMode = nightGlareMode
+            this.publishProperty('night_glare_mode', nightGlareMode)
+        } else {
+            console.warn(`Unexpected night glare status: ${nightGlareStatus}`)
+        }
     }
 
     processEnergyUsage(buf: Buffer) {
@@ -238,38 +405,33 @@ export default class Device extends AABBDevice {
         }
         this.lastStatSequence = sequence
 
-        // Marker 0x04: Fridge Stats
-        if (buf[3] === 0x04) {
+        // 10C5 packets contain data blocks identified by the second byte in each sequence.
+        // ID 0x01: Fridge Door Opens (Delta: buf[5~6])
+        if (buf[4] === 0x01) {
             const fridgeDelta = buf.readUInt16BE(5)
-            const fridgeAccum = buf.readUIntBE(7, 3)
             this.publishProperty('fridge_door_opens_delta', fridgeDelta.toString())
-            this.publishProperty('fridge_door_opens', fridgeAccum.toString())
+            // Accumulator: buf[7~9]
         }
 
-        // Marker 0x03: Freezer Stats
+        // ID 0x03: Freezer Door Opens (Delta: buf[11~12])
         if (buf[10] === 0x03) {
             const freezerDelta = buf.readUInt16BE(11)
-            const freezerAccum = buf.readUIntBE(13, 3)
             this.publishProperty('freezer_door_opens_delta', freezerDelta.toString())
-            this.publishProperty('freezer_door_opens', freezerAccum.toString())
+            // Accumulator: buf[13~15]
         }
 
-        // Marker 0x11: Unknown (previously thought to be Energy)
-        /*
+        // ID 0x11: Fridge Door Duration (Delta: buf[17~18])
         if (buf[16] === 0x11) {
-            const energyDelta = buf.readUInt16BE(17)
-            const energyAccum = buf.readUIntBE(19, 3)
-            this.publishProperty('energy_consumption_delta', energyDelta.toString())
-            this.publishProperty('energy_consumption', energyAccum.toString())
-        }
-        */
-
-        // Marker 0x13: Door Open Durations (Delta)
-        if (buf[22] === 0x13) {
-            const fridgeDurationDelta = buf.readUInt16BE(23)
-            const freezerDurationDelta = buf.readUInt16BE(26)
+            const fridgeDurationDelta = buf.readUInt16BE(17)
             this.publishProperty('fridge_door_duration_delta', fridgeDurationDelta.toString())
+            // Accumulator: buf[19~21]
+        }
+
+        // ID 0x13: Freezer Door Duration (Delta: buf[23~24])
+        if (buf[22] === 0x13) {
+            const freezerDurationDelta = buf.readUInt16BE(23)
             this.publishProperty('freezer_door_duration_delta', freezerDurationDelta.toString())
+            // Accumulator: buf[25~27]
         }
     }
 
@@ -296,30 +458,88 @@ export default class Device extends AABBDevice {
     setProperty(prop: string, mqttValue: string) {
         // We shouldn't receive any setProperty calls before the temperatureUnit is set. But let's be safe
         const unit = this.temperatureUnit || 'C'
-        const baseMessage = Buffer.from(
-            'F017FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF000000FFFF00FFFFFFFF00FFFFFFFFFFFFFFFFFF00FFFFFF1EFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF0AFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF',
-            'hex',
-        )
-        baseMessage[2 + 8] = unit === 'C' ? 1 : 0
-
         if (prop === 'fridge_setpoint') {
+            const baseMessage = buildF017Message(unit)
             baseMessage[2 + 1] = convertFridgeTemperature(unit, Number(mqttValue))
             this.send(baseMessage)
         } else if (prop === 'freezer_setpoint') {
+            const baseMessage = buildF017Message(unit)
             baseMessage[2 + 2] = convertFreezerTemperature(unit, Number(mqttValue))
             this.send(baseMessage)
         } else if (prop === 'flex_setpoint') {
             const index = FLEX_OPTIONS.indexOf(mqttValue)
             if (index < 0) console.warn(`Unexpected value ${mqttValue}`)
             else {
+                const baseMessage = buildF017Message(unit)
                 baseMessage[2 + 13] = 1 + index
                 this.send(baseMessage)
             }
         } else if (prop === 'express_freeze') {
+            if (mqttValue !== 'ON' && mqttValue !== 'OFF') {
+                console.warn(`Unexpected express freeze value ${mqttValue}`)
+                return
+            }
+            const baseMessage = buildF017Message(unit)
             baseMessage[2 + 3] = mqttValue === 'ON' ? 2 : 1
             this.send(baseMessage)
+        } else if (prop === 'smart_care') {
+            if (mqttValue !== 'ON' && mqttValue !== 'OFF') {
+                console.warn(`Unexpected Smart Care+ value ${mqttValue}`)
+                return
+            }
+
+            for (const command of buildSmartCareCommands(mqttValue === 'ON')) this.send(command)
+        } else if (prop === 'night_glare_mode') {
+            if (!NIGHT_GLARE_OPTIONS.includes(mqttValue as NightGlareMode)) {
+                console.warn(`Unexpected night glare mode ${mqttValue}`)
+                return
+            }
+            const mode = mqttValue as NightGlareMode
+            this.sendNightGlareSetting(mode)
+        } else if (prop === 'night_glare_start') {
+            if (!parseTime(mqttValue)) {
+                console.warn(`Unexpected night glare start time ${mqttValue}`)
+                return
+            }
+            this.nightGlareStart = mqttValue
+            this.publishProperty('night_glare_start', mqttValue)
+            if (this.nightGlareMode !== 'Off') this.sendNightGlareSetting(this.nightGlareMode)
+        } else if (prop === 'night_glare_end') {
+            if (!parseTime(mqttValue)) {
+                console.warn(`Unexpected night glare end time ${mqttValue}`)
+                return
+            }
+            this.nightGlareEnd = mqttValue
+            this.publishProperty('night_glare_end', mqttValue)
+            if (this.nightGlareMode !== 'Off') this.sendNightGlareSetting(this.nightGlareMode)
+        } else if (prop === 'night_glare_brightness') {
+            const brightness = Number(mqttValue)
+            if (!Number.isInteger(brightness) || brightness < 0 || brightness > 100) {
+                console.warn(`Unexpected night glare brightness ${mqttValue}`)
+                return
+            }
+            this.nightGlareBrightness = brightness
+            this.publishProperty('night_glare_brightness', brightness)
+            this.sendNightGlareSetting(this.nightGlareMode)
         } else {
             console.warn(`Unknown property ${prop}`)
+        }
+    }
+
+    sendNightGlareSetting(mode: NightGlareMode) {
+        try {
+            const command = buildNightGlareCommand(
+                mode,
+                this.nightGlareStart,
+                this.nightGlareEnd,
+                this.nightGlareBrightness,
+            )
+            this.send(command)
+            // Use the requested mode for subsequent local setting writes, but wait for a
+            // 10EB/10EC report before publishing the mode back to Home Assistant.
+            this.nightGlareMode = mode
+        } catch (err) {
+            console.warn(`Unable to build night glare command: ${err}`)
         }
     }
 }
